@@ -121,7 +121,9 @@ LearningPlaywrightFundamentals3x/
 │   │   ├── 223_TestAnnotations.spec.ts  # skip, only, fail, fixme, slow
 │   │   └── 224_TestDescribe.spec.ts     # grouping tests with describe
 │   ├── 03_Locator_Commands/
-│   │   └── 225_LC.spec.ts
+│   │   ├── 225_LC.spec.ts            # goto options: waitUntil, timeout, referer
+│   │   ├── 226_Refere.spec.ts        # context-wide referer via extraHTTPHeaders
+│   │   └── 227_Fresh.spec.ts         # CSS selectors on the VWO login form
 │   └── 04_.. 23_/             # remaining topics, see the curriculum table
 ├── docs/images/               # architecture diagram (png + html source)
 ├── playwright.config.ts       # testDir, reporter, trace, headless, projects
@@ -680,7 +682,135 @@ Install **Playwright Test for VSCode** (Microsoft). It gives you:
 
 ---
 
-## 16. Locator cheat sheet
+## 16. Navigation: `page.goto()` options and referers
+
+**Concept:** `page.goto()` takes an options object that decides how long Playwright waits before handing control back (`waitUntil`), how long it waits before giving up (`timeout`), and what `Referer` header the request carries.
+
+**Why:** The default `waitUntil: 'load'` waits for every image and stylesheet, which is wasted time on a heavy page when all you need is the DOM.
+
+**Q&A - why use this?**
+- **Q: Which `waitUntil` do I actually want?** A: `domcontentloaded` for most tests, the HTML is parsed and your locators can resolve. `commit` when you only care that the server responded and want to start asserting immediately.
+- **Q: What does `referer` here replace?** A: Hand-building a header on every call. It sets `Referer` for that one navigation, useful when an app gates content or analytics on where the traffic came from.
+- **Q: What's the gotcha?** A: This `referer` applies to a single `goto` only. For every request in the session, set `extraHTTPHeaders` on the context instead.
+
+```mermaid
+flowchart LR
+    A["page.goto&#40;url, options&#41;"] --> B{waitUntil}
+    B -->|commit| C[response received<br/>fastest]
+    B -->|domcontentloaded| D[HTML parsed<br/>good default]
+    B -->|load| E[images + CSS done<br/>the default]
+    B -->|networkidle| F[no requests 500ms<br/>discouraged, flaky]
+```
+
+**tests/03_Locator_Commands/225_LC.spec.ts** - all three options together:
+
+```ts
+test("Verify X", async ({ page }) => {
+    await page.goto(
+        "https://app.thetestingacademy.com/playwright/multiple_element_filter",
+        { waitUntil: 'commit' }
+    );
+
+    const response = await page.goto('https://app.thetestingacademy.com/login', {
+        waitUntil: 'domcontentloaded',
+        timeout: 45000,
+        referer: 'https://thetestingacademy.com'
+    });
+});
+```
+
+`goto` returns the main resource response, so you can assert on the status directly:
+
+```ts
+expect(response?.status()).toBe(200);
+```
+
+**tests/03_Locator_Commands/226_Refere.spec.ts** - the context-wide version, where every request in the session carries the header:
+
+```ts
+test("set referer for entire context", async ({ browser }) => {
+    const context = await browser.newContext({
+        extraHTTPHeaders: { "Referer": "https://thetestingacademy.com" }
+    });
+    const page = await context.newPage();
+
+    await page.goto("https://app.vwo.com/#login");                            // referer sent
+    await page.goto("https://katalon-demo-cura.herokuapp.com/profile.php");   // referer sent
+});
+```
+
+| Need | Use |
+|---|---|
+| One navigation carries the header | `goto(url, { referer })` |
+| Every request in the session carries it | `newContext({ extraHTTPHeaders })` |
+| Every request in the whole suite | `use: { extraHTTPHeaders }` in the config |
+
+---
+
+## 17. CSS selectors and the default locator strategies
+
+**Concept:** Before Playwright's `getByRole` family there were four classic hooks on an element, `id`, `name`, `class` and tag, and CSS selector syntax is how you reach each of them through `page.locator()`.
+
+**Why:** Not every app is accessible enough for role-based locators; when a field has no label and no test id, a stable `id` is the next best anchor.
+
+**Q&A - why use this?**
+- **Q: When do I reach for a CSS selector?** A: When the user-facing locators cannot see the element, typically unlabelled inputs, or when the app already has stable `id` attributes you control.
+- **Q: What does it replace?** A: XPath, in almost every case. CSS is shorter, faster and far more readable.
+- **Q: What's the gotcha?** A: Framework-generated classes (`text-input W&#40;100%&#41;`) and obfuscated attributes (`data-qa="hocewoqisi"`) change on every build. Anchor on `id` or a `data-testid` you own, never on styling classes.
+
+```mermaid
+flowchart TD
+    A[Element] --> B["id -> #login-username"]
+    A --> C["class -> .text-input"]
+    A --> D["name -> [name='username']"]
+    A --> E["tag -> input"]
+    B & C & D & E --> F["page.locator&#40;selector&#41;"]
+    F --> G[Prefer getByRole / getByLabel<br/>when the app exposes them]
+```
+
+Given this real VWO login field:
+
+```html
+<input type="email" class="text-input W(100%)" name="username"
+       id="login-username" data-qa="hocewoqisi" placeholder="Enter email ID">
+```
+
+**tests/03_Locator_Commands/227_Fresh.spec.ts** anchors on the stable ids and asserts the failure message:
+
+```ts
+test('tc#1 - Verify that the vwo page is loaded', async ({ page }) => {
+    await page.goto("https://app.vwo.com", {
+        waitUntil: 'domcontentloaded',
+        referer: "https://sdet.live"
+    });
+
+    const userNameField = page.locator("#login-username");
+    const passwordField = page.locator("#login-password");
+    const loginButton   = page.locator("#js-login-btn");
+
+    await userNameField.fill("admin@admin.com");
+    await passwordField.fill("pass123");
+    await loginButton.click();
+
+    const errorMessage = page.locator('#js-notification-box-msg');
+    await expect(errorMessage).toContainText(
+        "Your email, password, IP address or location did not match");
+});
+```
+
+| Hook | CSS syntax | Stable? |
+|---|---|:---:|
+| id | `#login-username` | yes, if hand written |
+| name | `[name="username"]` | usually |
+| class | `.text-input` | no, styling churns |
+| tag | `input` | too broad on its own |
+| test id | `[data-testid="login"]` | yes, you own it |
+
+Two habits worth carrying out of this file: `page.pause()` is a debugging tool that halts the run and opens the Inspector, so strip it before committing; and a `timeout` under about 5000ms on a real-world site is a flake waiting to happen.
+
+---
+
+## 18. Locator cheat sheet
 
 ```ts
 page.getByRole('button', { name: 'Submit' })   // preferred, accessibility based
@@ -696,11 +826,11 @@ page.locator('li').nth(2)
 page.locator('table tr').first()
 ```
 
-Order of preference: role -> label -> placeholder -> text -> testid -> CSS/XPath.
+Order of preference: role -> label -> placeholder -> text -> testid -> CSS/XPath. Section 17 covers the CSS end of that list, for the cases where the user-facing locators cannot reach the element.
 
 ---
 
-## 17. Common assertions
+## 19. Common assertions
 
 ```ts
 await expect(page).toHaveTitle(/Playwright/);
@@ -717,7 +847,7 @@ All `expect` calls auto-wait, so you rarely need `waitForTimeout`.
 
 ---
 
-## 18. Troubleshooting
+## 20. Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
@@ -730,7 +860,7 @@ All `expect` calls auto-wait, so you rarely need `waitForTimeout`.
 
 ---
 
-## 19. Useful links
+## 21. Useful links
 
 - Playwright docs: https://playwright.dev/docs/intro
 - Codegen guide: https://playwright.dev/docs/codegen
